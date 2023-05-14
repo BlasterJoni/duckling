@@ -3,8 +3,6 @@
 --
 -- This source code is licensed under the BSD-style license found in the
 -- LICENSE file in the root directory of this source tree.
-
-
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
@@ -16,30 +14,28 @@ import Control.Monad (unless, when)
 import Control.Monad.IO.Class
 import Data.Aeson
 import Data.ByteString (ByteString, empty)
+import qualified Data.ByteString.Lazy as LBS
+import qualified Data.ByteString.Lazy.Char8 as LBS8
 import Data.HashMap.Strict (HashMap)
+import qualified Data.HashMap.Strict as HashMap
 import Data.Maybe
 import Data.String
 import Data.Text (Text)
-import Data.Time.LocalTime.TimeZone.Series
-import Prelude
-import System.Directory
-import System.Environment (lookupEnv)
-import TextShow
-import Text.Read (readMaybe)
-import qualified Data.ByteString.Lazy as LBS
-import qualified Data.ByteString.Lazy.Char8 as LBS8
-import qualified Data.HashMap.Strict as HashMap
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
-
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
-import Snap.Core
-import Snap.Http.Server
-
+import Data.Time.LocalTime.TimeZone.Series
 import Duckling.Core
 import Duckling.Data.TimeZone
 import Duckling.Dimensions (allDimensions)
 import Duckling.Resolve (DucklingTime)
+import Snap.Core
+import Snap.Http.Server
+import System.Directory
+import System.Environment (lookupEnv)
+import Text.Read (readMaybe)
+import TextShow
+import Prelude
 
 createIfMissing :: FilePath -> IO ()
 createIfMissing f = do
@@ -70,26 +66,27 @@ main :: IO ()
 main = do
   tzs <- loadTZs
   p <- lookupEnv "PORT"
-  conf <- commandLineConfig $
-    maybe defaultConfig (`setPort` defaultConfig) (readMaybe =<< p)
+  conf <-
+    commandLineConfig $
+      maybe defaultConfig (`setPort` defaultConfig) (readMaybe =<< p)
   setupLogs conf
   httpServe conf $
-    ifTop (writeBS "quack!") <|>
-    route
-      [ ("targets", method GET targetsHandler)
-      , ("parse", method POST $ parseHandler tzs)
-      ]
+    ifTop (writeBS "quack!")
+      <|> route
+        [ ("targets", method GET targetsHandler),
+          ("parse", method POST $ parseHandler tzs)
+        ]
 
 -- | Return which languages have which dimensions
 targetsHandler :: Snap ()
 targetsHandler = do
   modifyResponse $ setHeader "Content-Type" "application/json"
-  writeLBS $ encode $
-    HashMap.fromList $ map dimText $ HashMap.toList supportedDimensions
+  writeLBS $
+    encode $
+      HashMap.fromList $ map dimText $ HashMap.toList supportedDimensions
   where
     dimText :: (Lang, [Seal Dimension]) -> (Text, [Text])
     dimText = (Text.toLower . showt) *** map (\(Seal d) -> toName d)
-
 
 -- | Parse some text into the given dimensions
 parseHandler :: HashMap Text TimeZoneSeries -> Snap ()
@@ -111,46 +108,60 @@ parseHandler tzs = do
       let timezone = parseTimeZone tz
       now <- liftIO $ currentReftime tzs timezone
 
-      let
-        lang = parseLang l
+      let lang = parseLang l
 
-        context = Context
-          { referenceTime = maybe now (parseRefTime timezone) ref
-          , locale = maybe (makeLocale lang Nothing) parseLocale loc
-          }
-        options = Options {withLatent = parseLatent latent}
+          context =
+            Context
+              { referenceTime = maybe now (parseRefTime timezone) ref,
+                locale = maybe (makeLocale lang Nothing) parseLocale loc
+              }
+          options = Options {withLatent = parseLatent latent}
 
-        cleanupDims =
+          cleanupDims =
             LBS8.filter (/= '\\') -- strip out escape chars people throw in
-          . stripSuffix "\"" -- remove trailing double quote
-          . stripPrefix "\"" -- remote leading double quote
+              . stripSuffix "\"" -- remove trailing double quote
+              . stripPrefix "\"" -- remote leading double quote
+            where
+              stripSuffix suffix str = fromMaybe str $ LBS.stripSuffix suffix str
+              stripPrefix prefix str = fromMaybe str $ LBS.stripPrefix prefix str
 
-          where
-            stripSuffix suffix str = fromMaybe str $ LBS.stripSuffix suffix str
-            stripPrefix prefix str = fromMaybe str $ LBS.stripPrefix prefix str
+          dims = fromMaybe (allDimensions lang) $ do
+            queryDims <- fmap (cleanupDims . LBS.fromStrict) ds
+            txtDims <- decode @[Text] queryDims
+            pure $ mapMaybe parseDimension txtDims
 
-        dims = fromMaybe (allDimensions lang) $ do
-          queryDims <- fmap (cleanupDims . LBS.fromStrict) ds
-          txtDims <- decode @[Text] queryDims
-          pure $ mapMaybe parseDimension txtDims
+          parsedResults = case parseArray tx of
+            Just texts -> map (parseText context options dims) texts
+            Nothing -> [parseText context options dims (Text.decodeUtf8 tx)]
 
-        parsedResult = parse (Text.decodeUtf8 tx) context options dims
-
-      writeLBS $ encode parsedResult
+      if length parsedResults == 1
+        then writeLBS $ encode $ head parsedResults
+        else writeLBS $ encode parsedResults
   where
     defaultLang = EN
     defaultLocale = makeLocale defaultLang Nothing
     defaultTimeZone = "America/Los_Angeles"
     defaultLatent = False
 
+    -- Helper function to parse an array of texts if present
+    parseArray :: ByteString -> Maybe [Text]
+    parseArray = decode . LBS.fromStrict
+
+    -- Helper function to parse a single text
+    parseText :: Context -> Duckling.Core.Options -> [Seal Dimension] -> Text -> Maybe [Entity]
+    parseText context options dims text =
+      let parsedResult = parse text context options dims
+       in Just parsedResult
+
     parseDimension :: Text -> Maybe (Seal Dimension)
     parseDimension x = fromName x <|> fromCustomName x
       where
         fromCustomName :: Text -> Maybe (Seal Dimension)
         fromCustomName name = HashMap.lookup name m
-        m = HashMap.fromList
-          [ -- ("my-dimension", Seal (CustomDimension MyDimension))
-          ]
+        m =
+          HashMap.fromList
+            []
+    -- ("my-dimension", Seal (CustomDimension MyDimension))
 
     parseTimeZone :: Maybe ByteString -> Text
     parseTimeZone = maybe defaultTimeZone Text.decodeUtf8
@@ -160,13 +171,16 @@ parseHandler tzs = do
       where
         (mlang, mregion) = case chunks of
           [a, b] -> (readMaybe a :: Maybe Lang, readMaybe b :: Maybe Region)
-          _      -> (Nothing, Nothing)
-        chunks = map Text.unpack
-          $ Text.split (== '_') $ Text.toUpper $ Text.decodeUtf8 x
+          _ -> (Nothing, Nothing)
+        chunks =
+          map Text.unpack $
+            Text.split (== '_') $ Text.toUpper $ Text.decodeUtf8 x
 
     parseLang :: Maybe ByteString -> Lang
-    parseLang l = fromMaybe defaultLang $ l >>=
-      readMaybe . Text.unpack . Text.toUpper . Text.decodeUtf8
+    parseLang l =
+      fromMaybe defaultLang $
+        l
+          >>= readMaybe . Text.unpack . Text.toUpper . Text.decodeUtf8
 
     parseRefTime :: Text -> ByteString -> DucklingTime
     parseRefTime timezone refTime = makeReftime tzs timezone utcTime
@@ -177,5 +191,7 @@ parseHandler tzs = do
           Nothing -> error "Please use milliseconds since epoch for reftime"
 
     parseLatent :: Maybe ByteString -> Bool
-    parseLatent x = fromMaybe defaultLatent
-      (readMaybe (Text.unpack $ Text.toTitle $ Text.decodeUtf8 $ fromMaybe empty x)::Maybe Bool)
+    parseLatent x =
+      fromMaybe
+        defaultLatent
+        (readMaybe (Text.unpack $ Text.toTitle $ Text.decodeUtf8 $ fromMaybe empty x) :: Maybe Bool)
